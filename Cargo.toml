@@ -1,0 +1,24 @@
+[package]
+name = "clipcast"
+version = "0.1.0"
+authors = ["Maxim Sokolov"]
+description = "A bidirectional clipboard synchronization tool that seamlessly connects local and remote machines over SSH, enabling real-time clipboard sharing with automatic reconnection and customizable clipboard handlers"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/aimech/clipcast"
+documentation = "https://docs.rs/clipcast"
+readme = "README.md"
+keywords = ["clipboard", "ssh", "sync", "remote", "tool"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.70.0"                                                                                                                                                                                                          # Specify minimum supported Rust version
+homepage = "https://github.com/aimech/clipcast"
+exclude = ["tests/*", "examples/*", ".github/*", "assets/*"]
+
+[dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+shlex = "1.3.0"
+tokio = { version = "1.42.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
