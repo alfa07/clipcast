@@ -278,7 +278,7 @@ impl Client {
         args.push("--");
         let remote_args = remote_args.join(" ");
         args.push(&remote_args);
-        info!("Connecting to remote server: {:?}", args);
+        info!("connecting to remote server: {:?}", args);
 
         let mut child = Command::new("ssh")
             .args(&args)
