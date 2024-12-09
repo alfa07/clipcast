@@ -29,11 +29,12 @@ A Rust-based tool for synchronizing clipboards between local and remote machines
 
 ## Installation
 
-1. Copy the script to your local and remote machines:
+1. Install `clipcast` on local and remote machines
 ```bash
+# Install locally
+cargo install clipcast
 # Copy to remote machine (replace 'remote-host' with your host)
-scp clipcast remote-host:~/bin/clipcast
-ssh remote-host "chmod +x ~/bin/clipcast"
+ssh remote-host "cargo install clipcast"
 ```
 
 2. For headless servers, ensure X server is running:
@@ -91,7 +92,7 @@ Advanced usage with custom environment:
 # On local machine, connecting to remote with specific environment setup
 clipcast client \
   --host remote-host \
-  --remote-server-cmd "source ~/.cargo/env && source ~/.bashrc && DISPLAY=:99 ~/bin/clipcast"
+  --remote-server-cmd "source ~/.cargo/env && DISPLAY=:99 clipcast"
 ```
 
 ## How It Works

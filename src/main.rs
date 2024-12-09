@@ -2,6 +2,7 @@
 //! ```cargo
 //! [dependencies]
 //! clap = { version = "4.5.23", features = ["derive"] }
+//! clap_complete = "4.4.10"
 //! serde = { version = "1.0.215", features = ["derive"] }
 //! serde_json = "1.0.133"
 //! shlex = "1.3.0"
@@ -9,11 +10,17 @@
 //! tracing = "0.1.41"
 //! tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 //! ```
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use shlex;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead,
+    AsyncBufReadExt,
+    AsyncWrite,
+    AsyncWriteExt,
+    BufReader,
+};
 use tokio::process::Command;
 use tokio::time::{self, timeout, Duration};
 use tracing::{error, info};
@@ -35,6 +42,8 @@ enum Cmd {
     ServerCmd(ServerCmd),
     #[command(name = "client")]
     ClientCmd(ClientCmd),
+    #[command(name = "generate")]
+    GenerateCmd(GenerateCmd),
 }
 
 #[derive(Args, Debug)]
@@ -74,6 +83,23 @@ struct ClientCmd {
     remote_read_clipboard_cmd: String,
 }
 
+#[derive(Debug, Copy, Clone, ValueEnum)]
+pub enum Shell {
+    #[value(name = "complete-bash")]
+    Bash,
+    #[value(name = "complete-zsh")]
+    Zsh,
+    #[value(name = "complete-fish")]
+    Fish,
+}
+
+#[derive(Args, Debug)]
+struct GenerateCmd {
+    /// Generate shell completion script
+    #[arg(value_enum)]
+    shell: Shell,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum Message {
@@ -88,123 +114,100 @@ enum Message {
 }
 
 struct Server {
-    last_clipboard: String,
-    write_cmd: String,
-    read_cmd: String,
+    cmd: ServerCmd,
 }
 
 impl Server {
-    fn new(write_cmd: String, read_cmd: String) -> Self {
-        Server {
-            last_clipboard: String::new(),
-            write_cmd,
-            read_cmd,
-        }
-    }
-
-    async fn get_clipboard(&self) -> Result<String, std::io::Error> {
-        let args = shlex::split(&self.read_cmd).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid read command")
-        })?;
-
-        if args.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Empty read command",
-            ));
-        }
-
-        let output = Command::new(&args[0])
-            .args(&args[1..])
-            .output().await?;
-
-        Ok(String::from_utf8(output.stdout).unwrap_or_default())
-    }
-
-    async fn set_clipboard(&self, content: &str) -> Result<(), std::io::Error> {
-        let args = shlex::split(&self.write_cmd).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid write command")
-        })?;
-
-        if args.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Empty write command",
-            ));
-        }
-
-        let mut child = Command::new(&args[0])
-            .args(&args[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(content.as_bytes()).await?;
-            stdin.flush().await?;
-            stdin.shutdown().await?;
-        }
-        child.wait().await?;
-        Ok(())
+    fn new(cmd: ServerCmd) -> Self {
+        Server { cmd }
     }
 
     async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let reader = BufReader::new(stdin);
-        let mut lines = reader.lines();
+        let lines = reader.lines();
 
-        let mut interval = time::interval(CLIPBOARD_CHECK_INTERVAL);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if let Ok(current_clip) = self.get_clipboard().await {
-                        if current_clip != self.last_clipboard {
-                            self.last_clipboard = current_clip.clone();
-                            let message = Message::Clip { clip: current_clip };
-                            send_with_timeout(&mut stdout, message).await?;
-                        }
-                    }
-                }
-                line_result = lines.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            match serde_json::from_str::<Message>(&line) {
-                                Ok(message) => {
-                                    match message {
-                                        Message::Ping => {
-                                            send_with_timeout(&mut stdout, Message::Pong).await?;
-                                        }
-                                        Message::Clip { clip } => {
-                                            self.last_clipboard = clip.clone();
-                                            if let Err(e) = self.set_clipboard(&clip).await {
-                                                eprintln!("Error setting clipboard: {}", e);
-                                                return Err(e.into());
-                                            }
-                                            send_with_timeout(&mut stdout, Message::Ack).await?;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Error parsing message: {}", e);
-                                    return Err(e.into());
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            // EOF reached
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            eprintln!("Error reading from stdin: {}", e);
-                            return Err(e.into());
-                        }
-                    }
-                }
-            }
+        run_message_loop(
+            &self.cmd.read_clipboard_cmd,
+            &self.cmd.write_clipboard_cmd,
+            &mut stdout,
+            lines,
+        )
+        .await
+    }
+}
+
+async fn check_and_send_update<T>(
+    read_cmd: &str,
+    last_clipboard: &mut String,
+    stdout: &mut T,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: AsyncWrite + Unpin,
+{
+    if let Ok(current_clip) = get_clipboard(read_cmd).await {
+        if current_clip != *last_clipboard {
+            info!("sending clipboard: len={}", current_clip.len());
+            *last_clipboard = current_clip.clone();
+            let message = Message::Clip { clip: current_clip };
+            send_with_timeout(stdout, message).await?;
         }
     }
+    Ok(())
+}
+
+async fn get_clipboard(read_cmd: &str) -> Result<String, std::io::Error> {
+    let args = shlex::split(read_cmd).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid read command",
+        )
+    })?;
+
+    if args.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Empty read command",
+        ));
+    }
+
+    let output = Command::new(&args[0]).args(&args[1..]).output().await?;
+
+    Ok(String::from_utf8(output.stdout).unwrap_or_default())
+}
+
+async fn set_clipboard(
+    write_cmd: &str,
+    content: &str,
+) -> Result<(), std::io::Error> {
+    let args = shlex::split(write_cmd).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid write command",
+        )
+    })?;
+
+    if args.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Empty write command",
+        ));
+    }
+
+    let mut child = Command::new(&args[0])
+        .args(&args[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(content.as_bytes()).await?;
+        stdin.flush().await?;
+        stdin.shutdown().await?;
+    }
+    child.wait().await?;
+    Ok(())
 }
 
 async fn send_with_timeout<T>(
@@ -236,74 +239,12 @@ where
 }
 
 struct Client {
-    host: String,
-    last_clipboard: String,
-    write_cmd: String,
-    read_cmd: String,
-    remote_server_cmd: String,
-    remote_write_cmd: String,
-    remote_read_cmd: String,
+    cmd: ClientCmd,
 }
 
 impl Client {
-    fn new(
-        host: String,
-        write_cmd: String,
-        read_cmd: String,
-        remote_server_cmd: String,
-        remote_write_cmd: String,
-        remote_read_cmd: String,
-    ) -> Self {
-        Client {
-            host,
-            last_clipboard: String::new(),
-            write_cmd,
-            read_cmd,
-            remote_server_cmd,
-            remote_write_cmd,
-            remote_read_cmd,
-        }
-    }
-
-    async fn get_clipboard(&self) -> Result<String, std::io::Error> {
-        let args = shlex::split(&self.read_cmd).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid read command")
-        })?;
-
-        if args.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Empty read command",
-            ));
-        }
-
-        let output = Command::new(&args[0]).args(&args[1..]).output().await?;
-
-        Ok(String::from_utf8(output.stdout).unwrap_or_default())
-    }
-
-    async fn set_clipboard(&self, content: &str) -> Result<(), std::io::Error> {
-        let args = shlex::split(&self.write_cmd).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid write command")
-        })?;
-
-        if args.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Empty write command",
-            ));
-        }
-
-        let mut child = Command::new(&args[0])
-            .args(&args[1..])
-            .stdin(Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(content.as_bytes()).await?;
-        }
-        child.wait().await?;
-        Ok(())
+    fn new(cmd: ClientCmd) -> Self {
+        Client { cmd }
     }
 
     async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -319,15 +260,20 @@ impl Client {
         }
     }
 
-    async fn run_connection(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut args = vec![self.host.as_str()];
-        let mut remote_args = vec![self.remote_server_cmd.clone(), "server".into()];
+    async fn run_connection(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut args = vec![self.cmd.host.as_str()];
+        let mut remote_args =
+            vec![self.cmd.remote_server_cmd.clone(), "server".into()];
 
         remote_args.push("--write-clipboard-cmd".into());
-        remote_args.push(format!("'{}'", self.remote_write_cmd.clone()));
+        remote_args
+            .push(format!("'{}'", self.cmd.remote_write_clipboard_cmd.clone()));
 
         remote_args.push("--read-clipboard-cmd".into());
-        remote_args.push(format!("'{}'", self.remote_read_cmd.clone()));
+        remote_args
+            .push(format!("'{}'", self.cmd.remote_read_clipboard_cmd.clone()));
 
         args.push("--");
         let remote_args = remote_args.join(" ");
@@ -342,63 +288,79 @@ impl Client {
 
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout).lines();
+        let reader = BufReader::new(stdout).lines();
 
-        let mut clip_interval = time::interval(CLIPBOARD_CHECK_INTERVAL);
-        let mut ping_interval = time::interval(PING_INTERVAL);
+        run_message_loop(
+            &self.cmd.read_clipboard_cmd,
+            &self.cmd.write_clipboard_cmd,
+            &mut stdin,
+            reader,
+        )
+        .await
+    }
+}
 
-        loop {
-            tokio::select! {
-                _ = clip_interval.tick() => {
-                    if let Ok(current_clip) = self.get_clipboard().await {
-                        if current_clip != self.last_clipboard {
-                            info!("sending clipboard: len={}", current_clip.len());
-                            self.last_clipboard = current_clip.clone();
-                            let message = Message::Clip { clip: current_clip };
-                            send_with_timeout(&mut stdin, message).await?;
-                        }
-                    }
-                }
-                _ = ping_interval.tick() => {
-                    info!("sending ping");
-                    send_with_timeout(&mut stdin, Message::Ping).await?;
-                }
-                line_result = reader.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            match serde_json::from_str::<Message>(&line) {
-                                Ok(message) => {
-                                    match message {
-                                        Message::Clip { clip } => {
-                                            info!("received clipboard: len={}", clip.len());
-                                            self.last_clipboard = clip.clone();
-                                            if let Err(e) = self.set_clipboard(&clip).await {
-                                                error!("Error setting clipboard: {}", e);
-                                                return Err(e.into());
-                                            }
+async fn run_message_loop<R, W>(
+    read_cmd: &str,
+    write_cmd: &str,
+    stdin: &mut W,
+    mut reader: tokio::io::Lines<R>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut last_clipboard = String::new();
+    let mut clip_interval = time::interval(CLIPBOARD_CHECK_INTERVAL);
+    let mut ping_interval = time::interval(PING_INTERVAL);
+
+    loop {
+        tokio::select! {
+            _ = clip_interval.tick() => {
+                check_and_send_update(read_cmd, &mut last_clipboard, stdin).await?;
+            }
+            _ = ping_interval.tick() => {
+                info!("sending ping");
+                send_with_timeout(stdin, Message::Ping).await?;
+            }
+            line_result = reader.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        match serde_json::from_str::<Message>(&line) {
+                            Ok(message) => {
+                                match message {
+                                    Message::Clip { clip } => {
+                                        info!("received clipboard: len={}", clip.len());
+                                        last_clipboard = clip.clone();
+                                        if let Err(e) = set_clipboard(write_cmd, &clip).await {
+                                            error!("Error setting clipboard: {}", e);
+                                            return Err(e.into());
                                         }
-                                        Message::Pong => {
-                                            info!("received pong");
-                                        }
-                                        Message::Ack => {
-                                            info!("received ack");
-                                        }
-                                        _ => {}
+                                    }
+                                    Message::Ping => {
+                                        info!("received ping");
+                                        send_with_timeout(stdin, Message::Pong).await?;
+                                    }
+                                    Message::Pong => {
+                                        info!("received pong");
+                                    }
+                                    Message::Ack => {
+                                        info!("received ack");
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Error parsing message: {}", e);
-                                    return Err(e.into());
-                                }
+                            }
+                            Err(e) => {
+                                error!("Error parsing message: {}", e);
+                                return Err(e.into());
                             }
                         }
-                        Ok(None) => {
-                            return Err("Connection closed".into());
-                        }
-                        Err(e) => {
-                            error!("Error reading from stdout: {}", e);
-                            return Err(e.into());
-                        }
+                    }
+                    Ok(None) => {
+                        return Err("Connection closed".into());
+                    }
+                    Err(e) => {
+                        error!("Error reading from stdout: {}", e);
+                        return Err(e.into());
                     }
                 }
             }
@@ -413,56 +375,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Cmd::ServerCmd(server) => run_server(server).await?,
         Cmd::ClientCmd(client) => run_client(client).await?,
+        Cmd::GenerateCmd(generate) => generate_completion(generate.shell),
     }
     Ok(())
 }
 
 async fn run_server(cli: ServerCmd) -> Result<(), Box<dyn std::error::Error>> {
-    let mut server = Server::new(cli.write_clipboard_cmd, cli.read_clipboard_cmd);
+    let mut server = Server::new(cli);
     server.run().await
 }
 
 async fn run_client(cli: ClientCmd) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
-    let mut client = Client::new(
-        cli.host,
-        cli.write_clipboard_cmd,
-        cli.read_clipboard_cmd,
-        cli.remote_server_cmd,
-        cli.remote_write_clipboard_cmd,
-        cli.remote_read_clipboard_cmd,
-    );
+    let mut client = Client::new(cli);
     client.run().await?;
     Ok(())
 }
 
+pub fn generate_completion(shell: Shell) {
+    let mut cli = Cli::command();
+    match shell {
+        Shell::Bash => clap_complete::generate(
+            clap_complete::shells::Bash,
+            &mut cli,
+            "clipcast",
+            &mut std::io::stdout(),
+        ),
+        Shell::Zsh => clap_complete::generate(
+            clap_complete::shells::Zsh,
+            &mut cli,
+            "clipcast",
+            &mut std::io::stdout(),
+        ),
+        Shell::Fish => clap_complete::generate(
+            clap_complete::shells::Fish,
+            &mut cli,
+            "clipcast",
+            &mut std::io::stdout(),
+        ),
+    }
+}
+
 pub fn init_tracing() {
-    use tracing_subscriber::{
-        layer::SubscriberExt,
-        util::SubscriberInitExt,
-    };
     use std::str::FromStr;
-    // Get log level from environment variable or use default
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     let env_filter = tracing_subscriber::EnvFilter::from_str(
-        std::env::var("RUST_LOG")
-            .unwrap_or_else(|_| "info".into())
-            .as_str(),
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()).as_str(),
     )
     .unwrap();
 
-    // Create a formatting layer with customized options
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)      // Include target in output
-        .with_thread_ids(false)  // Include thread IDs
-        .with_thread_names(false) // Include thread names
-        .with_file(true)        // Include file name
-        .with_line_number(true) // Include line number
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE) // Log spans when they close
-        .compact();             // Use compact format
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(true)
+        .with_line_number(false)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .compact();
 
-    // Initialize the tracing subscriber
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .init();
+    tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
 }
