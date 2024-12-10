@@ -1,6 +1,6 @@
 [package]
 name = "clipcast"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Maxim Sokolov"]
 description = "A bidirectional clipboard synchronization tool that seamlessly connects local and remote machines over SSH, enabling real-time clipboard sharing with automatic reconnection and customizable clipboard handlers"
 edition = "2021"
