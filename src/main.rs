@@ -12,14 +12,9 @@
 //! ```
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use shlex;
 use std::process::Stdio;
 use tokio::io::{
-    AsyncBufRead,
-    AsyncBufReadExt,
-    AsyncWrite,
-    AsyncWriteExt,
-    BufReader,
+    AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::process::Command;
 use tokio::time::{self, timeout, Duration};
@@ -27,7 +22,8 @@ use tracing::{error, info};
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(5);
 const CLIPBOARD_CHECK_INTERVAL: Duration = Duration::from_millis(500);
-const PING_INTERVAL: Duration = Duration::from_secs(10);
+const PING_INTERVAL: Duration = Duration::from_secs(3);
+const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -39,11 +35,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     #[command(name = "server")]
-    ServerCmd(ServerCmd),
+    Server(ServerCmd),
     #[command(name = "client")]
-    ClientCmd(ClientCmd),
+    Client(ClientCmd),
     #[command(name = "generate")]
-    GenerateCmd(GenerateCmd),
+    Generate(GenerateCmd),
 }
 
 #[derive(Args, Debug)]
@@ -229,11 +225,11 @@ where
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
             eprintln!("Error writing to stdout: {}", e);
-            return Err(e.into());
+            Err(e.into())
         }
         Err(e) => {
             eprintln!("Timeout writing to stdout: {}", e);
-            return Err(e.into());
+            Err(e.into())
         }
     }
 }
@@ -314,7 +310,9 @@ where
     let mut clip_interval = time::interval(CLIPBOARD_CHECK_INTERVAL);
     let mut ping_interval = time::interval(PING_INTERVAL);
 
-    loop {
+    let mut last_pong = time::Instant::now();
+
+    while (time::Instant::now() - last_pong) < PONG_TIMEOUT {
         tokio::select! {
             _ = clip_interval.tick() => {
                 check_and_send_update(read_cmd, &mut last_clipboard, stdin).await?;
@@ -343,6 +341,7 @@ where
                                     }
                                     Message::Pong => {
                                         info!("received pong");
+                                        last_pong = time::Instant::now();
                                     }
                                     Message::Ack => {
                                         info!("received ack");
@@ -366,6 +365,8 @@ where
             }
         }
     }
+    error!("pong timed out");
+    Err("Pong timeout".into())
 }
 
 #[tokio::main]
@@ -373,9 +374,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::ServerCmd(server) => run_server(server).await?,
-        Cmd::ClientCmd(client) => run_client(client).await?,
-        Cmd::GenerateCmd(generate) => generate_completion(generate.shell),
+        Cmd::Server(server) => run_server(server).await?,
+        Cmd::Client(client) => run_client(client).await?,
+        Cmd::Generate(generate) => generate_completion(generate.shell),
     }
     Ok(())
 }
