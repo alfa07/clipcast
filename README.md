@@ -79,6 +79,7 @@ clipcast client --host REMOTE_HOST [OPTIONS]
 
 Options:
 - `--host`: SSH host to connect to (required)
+- `--ssh-args`: Arguments for SSH session invoked by clipcast (default: )
 - `--write-clipboard-cmd`: Local command to write to clipboard (default: "pbcopy")
 - `--read-clipboard-cmd`: Local command to read from clipboard (default: "pbpaste")
 - `--remote-server-cmd`: Remote clipcast command (default: "clipcast")

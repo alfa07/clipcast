@@ -36,8 +36,10 @@ struct Cli {
 enum Cmd {
     #[command(name = "server")]
     Server(ServerCmd),
+
     #[command(name = "client")]
     Client(ClientCmd),
+
     #[command(name = "generate")]
     Generate(GenerateCmd),
 }
@@ -58,6 +60,10 @@ struct ClientCmd {
     /// SSH host to connect to
     #[arg(long)]
     host: String,
+
+    /// Arguments for SSH session invoked by clipcast
+    #[arg(long, allow_hyphen_values = true, num_args = 1, default_value = "")]
+    ssh_args: String,
 
     /// Command to write to clipboard
     #[arg(long, default_value = "pbcopy")]
@@ -259,7 +265,13 @@ impl Client {
     async fn run_connection(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut args = vec![self.cmd.host.as_str()];
+        let mut args: Vec<&str>;
+        if self.cmd.ssh_args.is_empty() {
+            args = vec![self.cmd.host.as_str()];
+        } else {
+            args = self.cmd.ssh_args.split(' ').collect();
+            args.push(self.cmd.host.as_str());
+        }
         let mut remote_args =
             vec![self.cmd.remote_server_cmd.clone(), "server".into()];
 
