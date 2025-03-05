@@ -61,7 +61,7 @@ struct ClientCmd {
     #[arg(long)]
     host: String,
 
-    /// SSH args
+    /// Arguments for SSH session invoked by clipcast
     #[arg(long, allow_hyphen_values = true, num_args = 1, default_value = "")]
     ssh_args: String,
 
