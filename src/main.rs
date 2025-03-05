@@ -61,7 +61,7 @@ struct ClientCmd {
     #[arg(long)]
     host: String,
 
-    // SSH args
+    /// SSH args
     #[arg(long, allow_hyphen_values = true, num_args = 1, default_value = "")]
     ssh_args: String,
 
@@ -265,11 +265,13 @@ impl Client {
     async fn run_connection(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // let mut args = vec![self.cmd.ssh_args.as_str()];
-        let mut args: Vec<&str> = self.cmd.ssh_args.split(' ').collect();
-        args.push(self.cmd.host.as_str());
-        // let mut args = vec![self.cmd.host.as_str()];
-        println!("{:?}", args);
+        let mut args: Vec<&str>;
+        if self.cmd.ssh_args.is_empty() {
+            args = vec![self.cmd.host.as_str()];
+        } else {
+            args = self.cmd.ssh_args.split(' ').collect();
+            args.push(self.cmd.host.as_str());
+        }
         let mut remote_args =
             vec![self.cmd.remote_server_cmd.clone(), "server".into()];
 
