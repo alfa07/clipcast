@@ -79,7 +79,7 @@ clipcast client --host REMOTE_HOST [OPTIONS]
 
 Options:
 - `--host`: SSH host to connect to (required)
-- `--ssh-args`: Arguments for SSH session invoked by clipcast (default: )
+- `--ssh-args`: Arguments for SSH session invoked by clipcast (default: "")
 - `--write-clipboard-cmd`: Local command to write to clipboard (default: "pbcopy")
 - `--read-clipboard-cmd`: Local command to read from clipboard (default: "pbpaste")
 - `--remote-server-cmd`: Remote clipcast command (default: "clipcast")
@@ -88,13 +88,60 @@ Options:
 
 ### Example Usage
 
-Advanced usage with custom environment:
+#### Advanced usage with custom environment:
 ```bash
 # On local machine, connecting to remote with specific environment setup
 clipcast client \
   --host remote-host \
   --remote-server-cmd "source ~/.cargo/env && DISPLAY=:99 clipcast"
 ```
+
+#### Run clipcast automatically alongside a SSH session:
+
+Create the following three files, editing as needed
+
+`~/.ssh/config`
+```bash
+Include ~/.ssh/default_config
+
+# Overload included default configuration and execute clipcast
+Host DOMAIN1* DOMAIN2* DOMAIN3*
+  LocalCommand $HOME/.ssh/clipcast.sh %h
+```
+
+`~/.ssh/default_config`
+```bash
+Host DOMAIN1* DOMAIN2* DOMAIN3*
+  HostName %h.REMAINING
+  User USER
+  IdentityFile ~/.ssh/PRIVATE_KEY
+  ForwardX11 yes
+```
+
+`~/.ssh/clipcast.sh`
+```bash
+#!/bin/bash
+
+# Get domain from remote host; e.g., domain from domain.example.com
+host="${1%%.*}"
+
+# Run clipcast using default config to prevent recursive LocalCommand spawning in ~/.ssh/config
+clipcast client --ssh-args "-F $HOME/.ssh/default_config" --host $host > /dev/null 2>&1 &
+pid=$!
+
+(
+  # Block until parent SSH process no longer exists
+  while kill -0 $PPID 2>/dev/null; do
+    sleep 1
+  done
+
+  # Kill all clipcast child process and created clipcast
+  pkill -P $pid
+  kill $pid
+) &
+```
+
+`~/.ssh/default_config` should contain the default setup for your SSH sessions. `~/.ssh/config` overloads `default_config` and runs the `clipcast.sh` script. We use this setup such that when `clipcast.sh` runs clipcast (which itself then runs SSH), the `LocalCommand` to run clipcast will not recursively execute.
 
 ## How It Works
 
