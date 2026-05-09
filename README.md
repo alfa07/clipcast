@@ -1,15 +1,15 @@
 # Clipcast
 
-A Rust-based tool for synchronizing clipboards between local and remote machines over SSH. It continuously monitors clipboard changes on both ends and automatically syncs the content, making it easy to copy-paste between machines.
+A Rust-based tool for synchronizing clipboards between local and remote machines over SSH, plus a `remote → local` file-open feature: run `open foo.pdf` on the remote and the file streams to your Mac and opens in the native GUI app.
 
 ## Features
 
-- Bidirectional clipboard synchronization
-- Works over SSH
+- Bidirectional clipboard synchronization over SSH
+- **Remote open**: `open <file>` on the remote ships the file to the local Mac and launches `open` on it, with an extension allowlist for safety
+- One-command deploy (`clipcast deploy --host <HOST>`) that cross-compiles locally and installs the binary + `open` symlink on the remote
 - Configurable clipboard commands for different platforms
 - Automatic reconnection on connection loss
 - Ping/pong mechanism to ensure connection health
-- Support for customizable clipboard commands
 
 ## Requirements
 
@@ -189,6 +189,37 @@ pid=$!
 
 `~/.ssh/default_config` should contain the default setup for your SSH sessions. `~/.ssh/config` overloads `default_config` and runs the `clipcast.sh` script. We use this setup such that when `clipcast.sh` runs clipcast (which itself then runs SSH), the `LocalCommand` to run clipcast will not recursively execute.
 
+## Remote Open
+
+Once clipcast is deployed (`clipcast deploy --host ec2`) and a client is running on your Mac (`clipcast client --host ec2`), you can open remote files in your local macOS GUI apps directly:
+
+```bash
+# on the remote:
+open report.pdf            # Preview launches on the Mac
+open foo.png bar.png       # both open in Preview
+open -a Safari https://...  # flags and URLs pass through unchanged
+```
+
+### How it works
+
+The `open` command on the remote is a symlink to `clipcast`. When invoked, clipcast's `argv[0]` dispatch routes to the open-client code, which:
+
+1. Classifies each argument — flags (`-...`), URLs (`://`), and non-existent paths pass through literally; existing files get shipped.
+2. Connects to the local unix socket (`$XDG_RUNTIME_DIR/clipcast-$USER.sock`) owned by the running `clipcast server`.
+3. Streams each file in 256 KiB base64 chunks through the SSH channel to your Mac.
+4. The Mac client writes files under `~/.clipcast/remote/<host>/<ts>-<rand>/`, checks them against an extension allowlist, rebuilds the argument vector with local paths, and runs `open` on them.
+5. Returns `0` if macOS `open` launched successfully, non-zero with an error message otherwise.
+
+### Limits
+
+- ≤ 50 MiB per file
+- ≤ 1024 files per call
+- ≤ 250 MiB per call total
+
+Files larger than these limits, or with extensions not in the allowlist (default covers common docs/images/media), are either rejected up front (limits) or saved-but-not-opened (allowlist) with an error returned to the remote caller. Override the allowlist with `clipcast client --open-allowlist pdf,png,txt,...`.
+
+Running `.app` bundles, shell scripts, or unknown extensions is intentionally blocked by default — the remote SSH session is a code-exec surface you should not hand to macOS `open` blindly.
+
 ## How It Works
 
 1. The client establishes an SSH connection to the remote server and launches server
@@ -197,6 +228,7 @@ pid=$!
 4. The receiving side updates its local clipboard
 5. Regular ping/pong messages ensure the connection stays alive
 6. On connection loss, the client automatically attempts to reconnect
+7. The remote server also binds a unix socket and relays incoming `open` requests onto the same SSH channel (see **Remote Open** above)
 
 ## Troubleshooting
 
