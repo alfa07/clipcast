@@ -22,32 +22,78 @@ A Rust-based tool for synchronizing clipboards between local and remote machines
   - Windows: TBD
 
 ### Remote Machine
-- Rust toolchain or rust-script installed
+- Linux or macOS (`x86_64` or `aarch64`) — `clipcast deploy` cross-compiles the right binary from your Mac; Rust is **not** required on the remote
 - X server running (for headless servers, you can use Xvfb)
 - `xclip` or similar clipboard tool
 - Proper environment variables set (DISPLAY, etc.)
 
 ## Installation
 
-1. Install `clipcast` on local and remote machines
+Build and install locally:
+
 ```bash
-# Install locally
-cargo install clipcast
-# Copy to remote machine (replace 'remote-host' with your host)
-ssh remote-host "cargo install clipcast"
+cargo install --path .
+# or
+cargo build --release && cp target/release/clipcast ~/bin/
 ```
 
-2. For headless servers, ensure X server is running:
+For the remote, use the built-in deploy command (see below) — it cross-compiles the right binary and installs it for you. You do not need Rust on the remote.
+
+For headless servers, ensure X server is running so the remote clipboard is accessible:
+
 ```bash
-# Install Xvfb if not present
 sudo apt install xvfb xclip
-
-# Start Xvfb (typically on display :99)
 Xvfb :99 -screen 0 1024x768x16 &
-
-# Set DISPLAY variable
 export DISPLAY=:99
 ```
+
+## Deployment
+
+`clipcast deploy` probes the remote for arch/OS, cross-compiles the correct target locally, atomically scps the binary into `~/.clipcast/bin/clipcast`, and creates an `open` symlink next to it:
+
+```bash
+clipcast deploy --host ec2
+```
+
+Add the install dir to the remote `PATH` (once):
+
+```bash
+ssh ec2 'echo "export PATH=\"\$HOME/.clipcast/bin:\$PATH\"" >> ~/.bashrc'
+```
+
+### Cross-compile prerequisites
+
+Deploying from macOS to Linux uses [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) + [zig](https://ziglang.org/) as the linker. First-run setup:
+
+```bash
+brew install zig                      # manual — Homebrew is never auto-driven
+cargo install cargo-zigbuild          # or add --yes to deploy to auto-install this
+rustup target add x86_64-unknown-linux-musl   # ditto
+```
+
+Subsequent deploys reuse the toolchain and are seconds-fast (incremental cargo + small scp).
+
+### Deploy flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--host <HOST>` | *(required)* | SSH host |
+| `--ssh-args <STR>` | `""` | Forwarded to ssh/scp |
+| `--install-dir <PATH>` | `~/.clipcast/bin` | Remote install directory |
+| `--symlinks <CSV>` | `open` | Symlink names to create next to the binary |
+| `--target <TRIPLE>` | *auto-detect* | Override detected target triple |
+| `--yes` | `false` | Auto-install missing user-scope tools (`rustup target`, `cargo-zigbuild`) |
+| `--skip-build` | `false` | Reuse existing `target/<triple>/release/clipcast` |
+| `--dry-run` | `false` | Print every step without executing |
+
+### Deploying while a client is connected
+
+The deploy uses an atomic `mv` into place, so if a `clipcast client` is already connected to the remote, the running `clipcast server` keeps its old-inode FD and continues working unaffected. Reconnect the client (or `pkill clipcast` on the remote) to pick up the new binary.
+
+### Alternative deploy modes (not implemented)
+
+- **rsync sources + build on remote** — simpler on remotes that already have rustc installed; not implemented in v1 because local cross-compile produces a faster iteration loop.
+- **Fetch prebuilt binaries from GitHub releases** — nice for "install from scratch" but can't deploy uncommitted local changes; would need a CI matrix. Future work.
 
 ## Usage
 

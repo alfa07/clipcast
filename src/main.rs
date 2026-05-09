@@ -10,6 +10,8 @@
 //! tracing = "0.1.41"
 //! tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 //! ```
+mod deploy;
+
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
@@ -42,6 +44,9 @@ enum Cmd {
 
     #[command(name = "generate")]
     Generate(GenerateCmd),
+
+    #[command(name = "deploy")]
+    Deploy(deploy::DeployCmd),
 }
 
 #[derive(Args, Debug)]
@@ -389,6 +394,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Server(server) => run_server(server).await?,
         Cmd::Client(client) => run_client(client).await?,
         Cmd::Generate(generate) => generate_completion(generate.shell),
+        Cmd::Deploy(deploy_cmd) => {
+            init_tracing();
+            deploy::run(deploy_cmd).await?
+        }
     }
     Ok(())
 }
