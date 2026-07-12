@@ -152,6 +152,9 @@ Include ~/.ssh/default_config
 
 # Overload included default configuration and execute clipcast
 Host DOMAIN1* DOMAIN2* DOMAIN3*
+  PermitLocalCommand yes
+  # Runs on the local machine once the SSH connection is up, before the
+  # remote shell starts; %h is the host you connected to
   LocalCommand $HOME/.ssh/clipcast.sh %h
 ```
 
@@ -188,6 +191,8 @@ pid=$!
 ```
 
 `~/.ssh/default_config` should contain the default setup for your SSH sessions. `~/.ssh/config` overloads `default_config` and runs the `clipcast.sh` script. We use this setup such that when `clipcast.sh` runs clipcast (which itself then runs SSH), the `LocalCommand` to run clipcast will not recursively execute.
+
+`PermitLocalCommand` defaults to `no`, so it must be set alongside `LocalCommand` or SSH will silently skip the hook.
 
 ## Remote Open
 
