@@ -48,6 +48,9 @@ const MAX_OPEN_FILES: usize = 1024;
 const MAX_OPEN_TOTAL: u64 = 250 * 1024 * 1024;
 const OPEN_CHUNK_SIZE: usize = 256 * 1024;
 
+const OPEN_CONNECT_RETRY_TOTAL: Duration = Duration::from_secs(3);
+const OPEN_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 const DEFAULT_OPEN_ALLOWLIST: &str = "pdf,png,jpg,jpeg,gif,webp,svg,txt,md,html,htm,csv,json,log,mp4,mov,mp3,wav,zip";
 
 #[derive(Parser, Debug)]
@@ -234,12 +237,7 @@ impl Server {
         if let Some(parent) = socket_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path)?;
-        let _ = std::fs::set_permissions(
-            &socket_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let listener = bind_control_socket(&socket_path)?;
         info!("control socket listening at {}", socket_path.display());
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Message>();
@@ -287,9 +285,29 @@ impl Server {
         .await;
 
         accept_handle.abort();
-        let _ = std::fs::remove_file(&socket_path);
         result
     }
+}
+
+/// Bind the control socket at `path`, taking over any socket a previous server
+/// left there.
+///
+/// This is the *only* place clipcast unlinks the well-known control socket: the
+/// incoming owner clears the path immediately before binding its own. Servers
+/// deliberately never unlink on exit. With a single shared path, an exit-time
+/// unlink would race a reconnecting successor — the old server would delete the
+/// *live* server's freshly-bound socket, and `open` clients would fail with
+/// ENOENT until the next reconnect. Letting only the new owner reset the path
+/// removes that race entirely. A stale socket left by a crash-exited server is
+/// harmless (connect → ECONNREFUSED) and is cleared by the next takeover here.
+fn bind_control_socket(path: &Path) -> std::io::Result<UnixListener> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    let _ = std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode(0o600),
+    );
+    Ok(listener)
 }
 
 async fn check_and_send_update<T>(
@@ -978,6 +996,39 @@ async fn handle_socket_client(
     }
 }
 
+/// Connect to the control socket, retrying briefly on a missing or refused
+/// socket.
+///
+/// During a client reconnect the socket is momentarily unavailable — the old
+/// server has gone (ENOENT) or its socket lingers with no listener
+/// (ECONNREFUSED) while the new server is not yet bound. Retrying lets `open`
+/// ride through that window instead of failing instantly. Other errors are
+/// returned immediately, and the whole loop is bounded by
+/// `OPEN_CONNECT_RETRY_TOTAL`.
+async fn connect_with_retry(
+    sock: &Path,
+) -> Result<UnixStream, Box<dyn std::error::Error>> {
+    let deadline = time::Instant::now() + OPEN_CONNECT_RETRY_TOTAL;
+    loop {
+        match UnixStream::connect(sock).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                let retriable = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                );
+                if !retriable || time::Instant::now() >= deadline {
+                    return Err(
+                        format!("connect {}: {}", sock.display(), e).into()
+                    );
+                }
+                time::sleep(OPEN_CONNECT_RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
 async fn run_open_client(
     raw_args: Vec<OsString>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1077,9 +1128,7 @@ async fn run_open_client(
     let sock = std::env::var("CLIPCAST_SOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_control_socket());
-    let stream = UnixStream::connect(&sock)
-        .await
-        .map_err(|e| format!("connect {}: {}", sock.display(), e))?;
+    let stream = connect_with_retry(&sock).await?;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -1295,4 +1344,72 @@ pub fn init_tracing() {
         .compact();
 
     tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_control_socket, connect_with_retry};
+    use rand::Rng;
+    use std::path::PathBuf;
+    use tokio::time::{self, Duration};
+
+    fn unique_tmp() -> PathBuf {
+        let n: u64 = rand::thread_rng().gen();
+        std::env::temp_dir()
+            .join(format!("clipcast-test-{}-{}.sock", std::process::id(), n))
+    }
+
+    // Reconnect regression: a new server takes over the shared path while the
+    // old one is still alive, then the old one exits. The new server's socket
+    // must survive so `open` keeps connecting.
+    #[tokio::test]
+    async fn takeover_survives_old_server_exit() {
+        let path = unique_tmp();
+
+        let old = bind_control_socket(&path).unwrap();
+        let new = bind_control_socket(&path).unwrap();
+
+        // Old server exits. In this design that closes its listener but never
+        // unlinks the path, so the new owner's socket is untouched.
+        drop(old);
+
+        assert!(path.exists(), "live socket must survive old server exit");
+        assert!(
+            connect_with_retry(&path).await.is_ok(),
+            "open must still reach the live server after a takeover"
+        );
+
+        drop(new);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A missing socket is retried briefly, then reported rather than hanging.
+    #[tokio::test]
+    async fn connect_retry_gives_up_on_missing_socket() {
+        let path = unique_tmp();
+        assert!(connect_with_retry(&path).await.is_err());
+    }
+
+    // The reconnect window: the socket is absent when `open` starts and a new
+    // server binds partway through the retry budget. `open` should ride through
+    // and connect rather than fail instantly.
+    #[tokio::test]
+    async fn connect_retry_rides_through_reconnect_gap() {
+        let path = unique_tmp();
+        let binder_path = path.clone();
+        let binder = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(300)).await;
+            let listener = bind_control_socket(&binder_path).unwrap();
+            time::sleep(Duration::from_millis(300)).await;
+            drop(listener);
+        });
+
+        assert!(
+            connect_with_retry(&path).await.is_ok(),
+            "open should connect once the new server binds within the window"
+        );
+
+        let _ = binder.await;
+        std::fs::remove_file(&path).ok();
+    }
 }
